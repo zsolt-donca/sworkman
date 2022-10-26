@@ -90,7 +90,7 @@ async def move_current_workspace_to_output(priorities, direction, size):
 
 
 def select_destination_output(output_name, outputs, workspaces, size):
-    output_index = [i for i, o in enumerate(outputs) if o.name == output_name][0]
+    output_index = get_output_index(output_name, outputs)
 
     workspaces_in_output = [w for w in workspaces if w.output == output_name and not is_workspace_empty(w)]
     workspaces_in_output.sort(key=lambda w: w.num)
@@ -111,19 +111,6 @@ def select_destination_output(output_name, outputs, workspaces, size):
         return output_index * size
 
 
-def get_focused_output(outputs):
-    focused_outputs = [o for o in outputs if o.focused]
-    if len(focused_outputs) == 1:
-        return focused_outputs[0]
-    else:
-        raise Exception(f"bug: could not get focused outputs: {outputs}")
-
-
-def is_workspace_empty(workspace):
-    rep = workspace.ipc_data["representation"]
-    return not workspace.ipc_data["floating_nodes"] and (not rep or rep == "H[]" or rep == "V[]" or rep == "S[]")
-
-
 # moves the current container to a new workspace on the destination output
 async def move_current_container_to_output(priorities, direction, size):
     i3 = await Connection().connect()
@@ -142,6 +129,40 @@ async def move_current_container_to_output(priorities, direction, size):
 
     # this moves the focused workspace to the selected output
     await i3.command(f'move workspace to output {output_name}')
+
+
+async def insert_current_workspace(priorities, size, number):
+    i3 = await Connection().connect()
+    outputs = await get_outputs_sorted(i3, priorities)
+    workspaces = await i3.get_workspaces()
+
+    current_workspace = [w for w in workspaces if w.focused][0]
+    current_workspace_num = current_workspace.num
+
+    output_name = current_workspace.output
+    output_index = get_output_index(output_name, outputs)
+
+    destination_workspace_num = output_index * size + number
+    if current_workspace_num == destination_workspace_num:
+        # if the current workspace is the same as the destination, there is nothing to do
+        return
+
+    workspaces_in_output = [w for w in workspaces if w.output == output_name and not is_workspace_empty(w)]
+
+    workspace_name_by_num = {w.num: w.name for w in workspaces_in_output}
+
+    source_num = current_workspace_num
+    dest_num = number
+    while True:
+        current_name = workspace_name_by_num[source_num]
+        new_name = change_num_in_name(current_name, source_num, dest_num)
+        await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
+
+        if dest_num in workspace_name_by_num.keys():
+            source_num = dest_num
+            dest_num = dest_num + 1
+        else:
+            break
 
 
 async def get_outputs_sorted(i3, priorities):
@@ -166,6 +187,27 @@ async def get_outputs_sorted(i3, priorities):
     # sort all outputs
     outputs.sort(key=lambda x: output_names_by_priority[x.name])
     return outputs
+
+
+def get_output_index(output_name, outputs):
+    output_indices = [i for i, o in enumerate(outputs) if o.name == output_name]
+    if len(output_indices) > 0:
+        return output_indices[0]
+    else:
+        raise Exception(f"bug: could not get output index: {output_name}, {outputs}")
+
+
+def get_focused_output(outputs):
+    focused_outputs = [o for o in outputs if o.focused]
+    if len(focused_outputs) == 1:
+        return focused_outputs[0]
+    else:
+        raise Exception(f"bug: could not get focused outputs: {outputs}")
+
+
+def is_workspace_empty(workspace):
+    rep = workspace.ipc_data["representation"]
+    return not workspace.ipc_data["floating_nodes"] and (not rep or rep == "H[]" or rep == "V[]" or rep == "S[]")
 
 
 # returns the absolute workspace number (e.g. 24) given a relative number (e.g. 4) and size (e.g. 20)
@@ -226,8 +268,8 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--number', type=int, help='the workspace number')
     parser.add_argument('action', type=str, help='the action to execute',
                         choices=['organize', 'focus_workspace', 'move_current_container_to_workspace', 'focus_output',
-                                 'move_current_workspace_to_output',
-                                 'move_current_container_to_output'])
+                                 'move_current_workspace_to_output', 'move_current_container_to_output',
+                                 'insert_current_workspace'])
 
     args = parser.parse_args()
 
@@ -244,6 +286,8 @@ if __name__ == "__main__":
         asyncio.run(move_current_workspace_to_output(args.priority, args.direction, args.size))
     elif action == 'move_current_container_to_output':
         asyncio.run(move_current_container_to_output(args.priority, args.direction, args.size))
+    elif action == 'insert_current_workspace':
+        asyncio.run(insert_current_workspace(args.priority, args.size, args.number))
 
     # TODO add action for inserting a workspace before another workspace (on the current output)
     # TODO organize arguments into sub-commands
