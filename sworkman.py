@@ -13,15 +13,16 @@ async def organize(size, priorities):
     workspaces = await i3.get_workspaces()
     outputs = await get_outputs_sorted(i3, priorities)
 
-    for outputs_index in range(len(outputs)):
-        output = outputs[outputs_index]
-        workspaces_in_output = list(filter(lambda x: x.output == output.name, workspaces))
-        for workspaces_in_output_index in range(len(workspaces_in_output)):
-            workspace = workspaces_in_output[workspaces_in_output_index]
+    for output_index, output in enumerate(outputs):
+        workspaces_in_output = [w for w in workspaces if w.output == output.name]
+        for workspace_index, workspace in enumerate(workspaces_in_output):
             current_name = workspace.name
-            new_num = outputs_index * size + workspaces_in_output_index
+            new_num = output_index * size + workspace_index
             new_name = change_num_in_name(current_name, workspace.num, new_num)
             await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
+
+    primary_output_name = outputs[0].name
+    await i3.command(f'focus output {primary_output_name}')
 
 
 async def focus_workspace(size, priorities, number):
@@ -58,7 +59,7 @@ async def move_current_workspace_to_output(priorities, direction, size):
     orig_output_name = get_focused_output(outputs).name
     dest_output_name = get_output_for_direction(outputs, direction).name
 
-    dest_workspace_num = select_destination_output(dest_output_name, outputs, workspaces)
+    dest_workspace_num = select_destination_output(dest_output_name, outputs, workspaces, size)
 
     # this renames the focused workspace to the next available workspace num on the given output
     for workspace in workspaces:
@@ -76,27 +77,38 @@ async def move_current_workspace_to_output(priorities, direction, size):
     workspaces_after = await i3.get_workspaces()
     for workspace in workspaces_after:
         workspace_output = workspace.output
-        is_workspace_relevant = (workspace_output == orig_output_name or workspace_output == dest_output_name)
-        is_only_workspace_on_output = len([w for w in workspaces if w.output == workspace_output]) == 1
-        if is_workspace_relevant and is_only_workspace_on_output and is_workspace_empty(workspace):
-            for outputs_index in range(len(outputs)):
-                output = outputs[outputs_index]
+        is_relevant = (workspace_output == orig_output_name or workspace_output == dest_output_name)
+        is_single = len([w for w in workspaces_after if w.output == workspace_output]) == 1
+        is_empty = is_workspace_empty(workspace)
+        if is_relevant and is_single and is_empty:
+            for output_index, output in enumerate(outputs):
                 if output.name == workspace_output:
                     current_name = workspace.name
-                    new_num = outputs_index * size
+                    new_num = output_index * size  # use the starting number for the output
                     new_name = change_num_in_name(current_name, workspace.num, new_num)
                     await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
 
 
-def select_destination_output(dest_output_name, outputs, workspaces):
-    workspaces_by_output = {o.name: [w for w in workspaces if w.output == o.name] for o in outputs}
-    # if the destination output has an empty workspace on it, let's move the current workspace over there
-    output_matching_workspace_num = [w.num for w in workspaces_by_output[dest_output_name] if is_workspace_empty(w)]
-    if len(output_matching_workspace_num) > 0:
-        dest_workspace_num = output_matching_workspace_num[0]
+def select_destination_output(output_name, outputs, workspaces, size):
+    output_index = [i for i, o in enumerate(outputs) if o.name == output_name][0]
+
+    workspaces_in_output = [w for w in workspaces if w.output == output_name and not is_workspace_empty(w)]
+    workspaces_in_output.sort(key=lambda w: w.num)
+
+    workspace_nums_in_output = {w.num for w in workspaces_in_output}
+    output_num_range = set(range(size * output_index, size * (output_index + 1)))
+
+    unused_nums = output_num_range.difference(workspace_nums_in_output)
+
+    if unused_nums:
+        # if there are some unused numbers, let's use the smallest
+        return min(unused_nums)
+    elif len(workspaces_in_output) > 0:
+        # if all numbers are taken, let's use the last number + 1 if all numbers are taken
+        return workspaces_in_output[-1].num + 1
     else:
-        dest_workspace_num = get_next_workspace_number_for_output(workspaces, dest_output_name)
-    return dest_workspace_num
+        # if all else fails, let's just use the starting number for the output
+        return output_index * size
 
 
 def get_focused_output(outputs):
@@ -108,20 +120,19 @@ def get_focused_output(outputs):
 
 
 def is_workspace_empty(workspace):
-    return not workspace.ipc_data["floating_nodes"] and (
-                not workspace.ipc_data["representation"] or workspace.ipc_data["representation"] == "H[]" or
-                workspace.ipc_data["representation"] == "V[]" or workspace.ipc_data["representation"] == "S[]")
+    rep = workspace.ipc_data["representation"]
+    return not workspace.ipc_data["floating_nodes"] and (not rep or rep == "H[]" or rep == "V[]" or rep == "S[]")
 
 
 # moves the current container to a new workspace on the destination output
-async def move_current_container_to_output(priorities, direction):
+async def move_current_container_to_output(priorities, direction, size):
     i3 = await Connection().connect()
     outputs = await get_outputs_sorted(i3, priorities)
     workspaces = await i3.get_workspaces()
 
     output_name = get_output_for_direction(outputs, direction).name
 
-    dest_workspace_num = select_destination_output(output_name, outputs, workspaces)
+    dest_workspace_num = select_destination_output(output_name, outputs, workspaces, size)
 
     # moves the current container to a new workspace (as workspace named new_workspace_num does not exist)
     await i3.command(f'move container to workspace number {dest_workspace_num}')
@@ -160,11 +171,11 @@ async def get_outputs_sorted(i3, priorities):
 # returns the absolute workspace number (e.g. 24) given a relative number (e.g. 4) and size (e.g. 20)
 # requires outputs to be sorted (by priority)
 def get_workspace_number(outputs, size, number):
-    for outputs_index in range(len(outputs)):
-        output = outputs[outputs_index]
+    for output_index, output in enumerate(outputs):
         if output.focused:
-            workspace_number = outputs_index * size + number
+            workspace_number = output_index * size + number
             return workspace_number
+
     raise Exception(f"bug: could not find workspace number; {outputs}, {size}, {number}")
 
 
@@ -177,10 +188,9 @@ def get_output_for_direction(outputs, direction):
     else:
         raise Exception(f"bug: invalid direction: {direction}")
 
-    for outputs_index in range(len(outputs)):
-        output = outputs[outputs_index]
+    for output_index, output in enumerate(outputs):
         if output.focused:
-            index_at_direction = (outputs_index + offset) % len(outputs)
+            index_at_direction = (output_index + offset) % len(outputs)
             output_at_direction = outputs[index_at_direction]
             return output_at_direction
 
@@ -198,7 +208,7 @@ def change_num_in_name(name, current_num, new_num):
 
 
 def get_next_workspace_number_for_output(workspaces, output_name):
-    workspace_nums_in_output =  [w.num for w in workspaces if w.output == output_name]
+    workspace_nums_in_output = [w.num for w in workspaces if w.output == output_name]
     if len(workspace_nums_in_output) > 0:
         next_workspace_num = max(workspace_nums_in_output) + 1
         return next_workspace_num
@@ -233,7 +243,7 @@ if __name__ == "__main__":
     elif action == 'move_current_workspace_to_output':
         asyncio.run(move_current_workspace_to_output(args.priority, args.direction, args.size))
     elif action == 'move_current_container_to_output':
-        asyncio.run(move_current_container_to_output(args.priority, args.direction))
+        asyncio.run(move_current_container_to_output(args.priority, args.direction, args.size))
 
     # TODO add action for inserting a workspace before another workspace (on the current output)
     # TODO organize arguments into sub-commands
