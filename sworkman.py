@@ -17,12 +17,16 @@ async def organize(size, priorities):
         workspaces_in_output = [w for w in workspaces if w.output == output.name]
         for workspace_index, workspace in enumerate(workspaces_in_output):
             current_name = workspace.name
+            current_num = workspace.num
             new_num = output_index * size + workspace_index
-            new_name = change_num_in_name(current_name, workspace.num, new_num)
-            await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
+            if current_num != new_num:
+                new_name = change_num_in_name(current_name, current_num, new_num)
+                await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
 
-    primary_output_name = outputs[0].name
-    await i3.command(f'focus output {primary_output_name}')
+    primary_output = outputs[0]
+    if not primary_output.focused:
+        primary_output_name = primary_output.name
+        await i3.command(f'focus output {primary_output_name}')
 
 
 async def focus_workspace(size, priorities, number):
@@ -74,19 +78,24 @@ async def move_current_workspace_to_output(priorities, direction, size):
     await i3.command(f'move workspace to output {dest_output_name}')
 
     # check if the original output became empty after the above operations, and if so, rename it according to its index
-    workspaces_after = await i3.get_workspaces()
-    for workspace in workspaces_after:
-        workspace_output = workspace.output
-        is_relevant = (workspace_output == orig_output_name or workspace_output == dest_output_name)
-        is_single = len([w for w in workspaces_after if w.output == workspace_output]) == 1
-        is_empty = is_workspace_empty(workspace)
-        if is_relevant and is_single and is_empty:
-            for output_index, output in enumerate(outputs):
-                if output.name == workspace_output:
-                    current_name = workspace.name
-                    new_num = output_index * size  # use the starting number for the output
-                    new_name = change_num_in_name(current_name, workspace.num, new_num)
-                    await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
+    await rename_any_empty_workspace(i3, outputs, size)
+
+
+async def rename_any_empty_workspace(i3, outputs, size):
+    workspaces = await i3.get_workspaces()
+    for workspace in workspaces:
+        if is_workspace_empty(workspace):
+            workspace_output = workspace.output
+            is_workspace_single_on_output = len([w for w in workspaces if w.output == workspace_output]) == 1
+            if is_workspace_single_on_output:
+                for output_index, output in enumerate(outputs):
+                    if output.name == workspace_output:
+                        current_name = workspace.name
+                        current_num = workspace.num
+                        new_num = output_index * size  # use the starting number for the output
+                        if current_num != new_num:
+                            new_name = change_num_in_name(current_name, current_num, new_num)
+                            await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
 
 
 def select_destination_output(output_name, outputs, workspaces, size):
@@ -117,9 +126,10 @@ async def move_current_container_to_output(priorities, direction, size):
     outputs = await get_outputs_sorted(i3, priorities)
     workspaces = await i3.get_workspaces()
 
-    output_name = get_output_for_direction(outputs, direction).name
+    orig_output_name = get_focused_output(outputs).name
+    dest_output_name = get_output_for_direction(outputs, direction).name
 
-    dest_workspace_num = select_destination_output(output_name, outputs, workspaces, size)
+    dest_workspace_num = select_destination_output(dest_output_name, outputs, workspaces, size)
 
     # moves the current container to a new workspace (as workspace named new_workspace_num does not exist)
     await i3.command(f'move container to workspace number {dest_workspace_num}')
@@ -128,7 +138,10 @@ async def move_current_container_to_output(priorities, direction, size):
     await i3.command(f'workspace number {dest_workspace_num}')
 
     # this moves the focused workspace to the selected output
-    await i3.command(f'move workspace to output {output_name}')
+    await i3.command(f'move workspace to output {dest_output_name}')
+
+    # check if the original output became empty after the above operations, and if so, rename it according to its index
+    await rename_any_empty_workspace(i3, outputs, size)
 
 
 async def insert_current_workspace(priorities, size, number):
@@ -136,34 +149,68 @@ async def insert_current_workspace(priorities, size, number):
     outputs = await get_outputs_sorted(i3, priorities)
     workspaces = await i3.get_workspaces()
 
+    workspace_name_by_num = {w.num: w.name for w in workspaces}
     current_workspace = [w for w in workspaces if w.focused][0]
+    current_workspace_name = current_workspace.name
     current_workspace_num = current_workspace.num
 
     output_name = current_workspace.output
     output_index = get_output_index(output_name, outputs)
 
     destination_workspace_num = output_index * size + number
+
+    # if the current workspace is the same as the destination, there is nothing to do
     if current_workspace_num == destination_workspace_num:
-        # if the current workspace is the same as the destination, there is nothing to do
         return
 
-    workspaces_in_output = [w for w in workspaces if w.output == output_name and not is_workspace_empty(w)]
+    # if the destination workspace does not exist (or is empty), let's just rename the current one to it and return
+    if destination_workspace_num not in workspace_name_by_num.keys():
+        new_name = change_num_in_name(current_workspace_name, current_workspace_num, destination_workspace_num)
+        await i3.command(f'rename workspace "{current_workspace_name}" to "{new_name}"')
+        return
 
-    workspace_name_by_num = {w.num: w.name for w in workspaces_in_output}
+    # obtains a temporary workspace numer - used when the range of workspaces is full
+    def temp_num():
+        workspace_num_ceil = max(workspace_name_by_num.keys()) + 2
+        free_nums = list(filter(lambda n: n not in workspace_name_by_num.keys(), range(0, workspace_num_ceil)))
+        return free_nums[0]
 
-    source_num = current_workspace_num
-    dest_num = number
-    while True:
-        current_name = workspace_name_by_num[source_num]
-        new_name = change_num_in_name(current_name, source_num, dest_num)
-        await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
+    # build the range of source and destination workspaces for the subsequent rename commands
+    if current_workspace_num < destination_workspace_num:
+        workspace_range = list(range(current_workspace_num, destination_workspace_num + 1))
+        unused = list(filter(lambda n: n not in workspace_name_by_num.keys(), workspace_range))
 
-        if dest_num in workspace_name_by_num.keys():
-            source_num = dest_num
-            dest_num = dest_num + 1
+        # if there are no unused workspace numbers in this range, we'll need to use a temporary workspace name
+        if not unused:
+            swap_num = temp_num()
+            source_range = workspace_range + [swap_num]
+            dest_range = [swap_num] + workspace_range
         else:
-            break
+            swap_num = max(unused)
+            source_range = list(range(swap_num + 1, destination_workspace_num + 1)) + [current_workspace_num]
+            dest_range = list(range(swap_num, destination_workspace_num + 1))
+    else:
+        workspace_range = list(range(current_workspace_num, destination_workspace_num - 1, -1))
+        unused = list(filter(lambda n: n not in workspace_name_by_num.keys(), workspace_range))
 
+        if not unused:
+            swap_num = temp_num()
+            source_range = workspace_range + [swap_num]
+            dest_range = [swap_num] + workspace_range
+        else:
+            swap_num = min(unused)
+            source_range = list(range(swap_num - 1, destination_workspace_num - 1, -1)) + [current_workspace_num]
+            dest_range = list(range(swap_num, destination_workspace_num - 1, -1))
+
+    for source, dest in zip(source_range, dest_range):
+        # we used a temporary name for the current workspace (there were no unused numbers)
+        if not unused and source == swap_num:
+            current_name = change_num_in_name(current_workspace_name, current_workspace_num, swap_num)
+        else:
+            current_name = workspace_name_by_num[source]
+
+        new_name = change_num_in_name(current_name, source, dest)
+        await i3.command(f'rename workspace "{current_name}" to "{new_name}"')
 
 async def get_outputs_sorted(i3, priorities):
     # get the outputs
